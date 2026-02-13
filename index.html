@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>医疗知识图谱问答系统</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 font-sans">
+
+  <!-- 顶部导航 -->
+  <nav class="bg-white shadow">
+    <div class="container mx-auto px-6 py-4 flex justify-between items-center">
+      <div class="text-xl font-bold text-blue-600">医疗助手</div>
+      <div class="space-x-6 text-gray-600">
+        <a href="#" class="hover:text-blue-600">Home</a>
+        <a href="#" class="hover:text-blue-600">Features</a>
+        <a href="#" class="hover:text-blue-600">About</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- 主体 -->
+  <main class="container mx-auto px-4 py-20 max-w-3xl">
+    <div class="w-full bg-white rounded-xl shadow-lg overflow-hidden">
+      <div class="p-8 text-center">
+        <h1 class="text-4xl lg:text-5xl font-bold">
+          <span class="text-2xl lg:text-3xl text-gray-400 block font-medium">I'm ready to help,</span>
+          Ask me anything.
+        </h1>
+      </div>
+
+      <!-- 聊天区域 -->
+      <div id="chatContainer" class="border-t border-gray-200">
+        <div id="chatMessages" class="h-64 overflow-y-auto p-4 space-y-4 bg-gray-50"></div>
+        <div class="p-4 bg-white">
+          <form id="chatForm" class="flex space-x-2">
+            <input 
+              id="userInput" 
+              type="text" 
+              class="flex-1 p-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500" 
+              placeholder="请输入您的问题..."
+              autocomplete="off">
+            <button 
+              type="submit"
+              class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600">
+              发送
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 底部 -->
+  <footer class="bg-white border-t text-center py-6 text-gray-500 text-sm">
+    © 2026 医疗助手 · <a href="#" class="hover:text-blue-600">Privacy</a> · <a href="#" class="hover:text-blue-600">Terms</a> · <a href="#" class="hover:text-blue-600">Contact</a>
+  </footer>
+
+<script>
+document.getElementById("chatForm").addEventListener("submit", async function(e) {
+  e.preventDefault();
+  const input = document.getElementById("userInput");
+  const text = input.value.trim();
+  if (!text) return;
+
+  addMessage(text, "user");
+  input.value = "";
+
+  try {
+    const response = await fetch("http://127.0.0.1:5000/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: text })
+    });
+    const data = await response.json();
+    addMessage(data.answer, "bot");
+  } catch (error) {
+    addMessage("服务器连接失败，请确认后端已启动。", "bot");
+  }
+});
+
+function addMessage(text, sender) {
+  const chatBox = document.getElementById("chatMessages");
+  const row = document.createElement("div");
+  row.className = "flex " + (sender === "user" ? "justify-end" : "justify-start");
+
+  const bubble = document.createElement("div");
+  bubble.className = "px-4 py-2 rounded-lg shadow text-sm max-w-[70%] " + 
+    (sender === "user" 
+      ? "bg-blue-500 text-white" 
+      : "bg-gray-200 text-gray-700");
+  bubble.innerText = text;
+
+  row.appendChild(bubble);
+  chatBox.appendChild(row);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+</script>
+
+</body>
+</html>
