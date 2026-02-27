@@ -60,17 +60,39 @@ class KGRAG():
             "cause": 2,
             "belongs_to": 1
         }
-
+        self.session_memory = {}
+        self.max_rounds = 5
         self.evaluator = AnswerEvaluator()
-        return
 
     def entity_linking(self, query):
-        return entity_parser.check_medical(query)
+        raw_entities = entity_parser.check_medical(query)
+
+        normalized_entities = []
+
+        # 情况1：如果返回的是 dict，例如 {"感冒": ["disease"]}
+        if isinstance(raw_entities, dict):
+            for name, type_list in raw_entities.items():
+                for etype in type_list:
+                    normalized_entities.append({
+                        "name": name.strip(),
+                        "type": etype.lower()
+                    })
+
+        # 情况2：如果返回的是 list of tuple，例如 [("感冒","disease")]
+        elif isinstance(raw_entities, list):
+            for item in raw_entities:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    normalized_entities.append({
+                        "name": item[0].strip(),
+                        "type": item[1].lower()
+                    })
+
+        return normalized_entities
 
     def link_entity_rel(self, query, entity, entity_type):
         cate = [self.cn_dict.get(i) for i in self.entity_rel_dict.get(entity_type)]
         prompt = "请判定问题：{query}所提及的是{entity}的哪几个信息，请从{cate}中进行选择，并以列表形式返回。".format(query=query, entity=entity, cate=cate)
-        answer = model.chat(query=prompt, history=[])
+        answer = model.chat(query=prompt, _=[])
         cls_rel = set([i for i in re.split(r"[\[。、, ;'\]]", answer)]).intersection(set(cate))
         print([prompt, answer, cls_rel])
         return cls_rel
@@ -105,14 +127,57 @@ class KGRAG():
         # 限制最多传给 LLM 的三元组数量
         triples = list(triples)[:30]  # 建议 20~50
         return list(triples)
+    
+    def classify_intent(self, query):
 
-    def format_prompt(self, query, context):
+        scores = {
+            "DRUG_QUERY": 0,
+            "DISEASE_PROPERTY": 0,
+            "SYMPTOM_DIAGNOSIS": 0
+        }
+
+        drug_keywords = ["吃什么药", "用什么药", "推荐药", "药物"]
+        property_keywords = ["是什么", "原因", "病因", "属于", "科室"]
+        symptom_keywords = ["疼", "痛", "难受", "发热", "头晕", "恶心", "咳血", "失力"]
+
+        # DRUG 打分
+        for k in drug_keywords:
+            if k in query:
+                scores["DRUG_QUERY"] += 3
+
+        # PROPERTY 打分
+        for k in property_keywords:
+            if k in query:
+                scores["DISEASE_PROPERTY"] += 2
+
+        # SYMPTOM 打分
+        if "我" in query:
+            scores["SYMPTOM_DIAGNOSIS"] += 1
+
+        for k in symptom_keywords:
+            if k in query:
+                scores["SYMPTOM_DIAGNOSIS"] += 2
+
+        # 选择最高分
+        best_intent = max(scores, key=scores.get)
+
+        # 如果全是0，默认问诊
+        if scores[best_intent] == 0:
+            return "SYMPTOM_DIAGNOSIS"
+
+        print("意图得分:", scores)
+
+        return best_intent
+
+    def format_prompt(self, query, context, history_summary=""):
         triples_str = "\n".join(context) if isinstance(context, (list, set)) else str(context)
         prompt = f"""
 你是一名专业的医疗智能问诊助手。
 
 用户当前描述的不适为：
 「{query}」
+以下是历史对话摘要：
+{history_summary}
 
 请按照下面结构回答：
 
@@ -161,12 +226,50 @@ class KGRAG():
         diseases = re.findall(r"'(.*?)'", answer)
         return diseases
 
-    def chat(self, query):
+    def chat(self, query, session_id="default"):
+        # 1️⃣ 初始化 session
+        if session_id not in self.session_memory:
+            self.session_memory[session_id] = {
+                "history": [],
+                "last_disease": None,
+                "last_intent": None
+            }
+
+        session = self.session_memory[session_id]
+
+        # 2️⃣ 意图识别
+        intent = self.classify_intent(query)
+        session["last_intent"] = intent
+        print("识别意图:", intent)
+
+        # 3️⃣ 分发处理
+        if intent == "SYMPTOM_DIAGNOSIS":
+            result = self.handle_symptom_diagnosis(query, session)
+
+        elif intent == "DISEASE_PROPERTY":
+            result = self.handle_property_query(query, session)
+
+        elif intent == "DRUG_QUERY":
+            result = self.handle_drug_query(query, session)
+
+        else:
+            result = {"answer": "暂未识别问题类型。", "evaluation": {}}
+
+        # 4️⃣ 保存对话历史
+        session["history"].append(f"用户: {query}")
+        session["history"].append(f"助手: {result['answer']}")
+
+        # 只保留最近10条
+        session["history"] = session["history"][-10:]
+
+        return result
+    
+    def handle_symptom_diagnosis(self, query, session):
         print("step1: LLM 推断可能疾病...")
         entities = self.entity_linking(query)
-        symptoms = [e for e in entities if e[1] == "symptom"]
+        symptoms = [e for e in entities if e["type"] == "symptom"]
+        symptom_names = [e["name"] for e in symptoms]
 
-        symptom_names = [s for s,_ in symptoms]
         kg_disease_scores = self.retrieve_disease_by_symptom_weighted(symptom_names)
 
         # 按症状命中数排序，取 TopK
@@ -182,9 +285,13 @@ class KGRAG():
 
         candidate_diseases = list(dict.fromkeys(kg_diseases + llm_candidates))
 
+        if candidate_diseases:
+            session["last_disease"] = candidate_diseases[0]
+
         if not candidate_diseases:
             print("LLM未推断出疾病，fallback纯LLM回答")
-            return model.chat(query=self.format_prompt(query, []))
+            history_summary = self.compress_history(session["history"])
+            return model.chat(query=self.format_prompt(query, [], history_summary))
         print("推断疾病:", candidate_diseases)
         print("step2: 用候选疾病召回KG...")
         fact_pool = []
@@ -220,6 +327,8 @@ class KGRAG():
             )
         ][:30]
         print("step3: 二次LLM综合生成...")
+        history_summary = self.compress_history(session["history"])
+        print("传给LLM的历史摘要:", history_summary)
         final_prompt = self.format_prompt(query, facts)
         raw_answer = model.chat(query=final_prompt)
         # 如果返回的是OpenAI格式
@@ -232,6 +341,92 @@ class KGRAG():
             "answer": answer,
             "evaluation": evaluation
         }
+    
+    def handle_property_query(self, query, session):
+
+        entities = self.entity_linking(query)
+
+        if not entities:
+            return {"answer": "知识库中未识别到相关疾病。", "evaluation": {}}
+
+        entity_name = entities[0]["name"]
+        entity_type = entities[0]["type"]
+
+        if entity_type == "disease":
+            session["last_disease"] = entity_name
+
+        if entity_type != "disease":
+            return {"answer": "当前问题更适合问诊模式。", "evaluation": {}}
+
+        # 用 LLM 判定问的是哪个属性
+        rels = self.link_entity_rel(query, entity_name, entity_type)
+
+        if not rels:
+            return {"answer": "未识别到具体查询属性。", "evaluation": {}}
+
+        facts = self.recall_facts(rels, entity_type, entity_name)
+
+        if not facts:
+            return {"answer": f"知识库中暂无 {entity_name} 的相关信息。", "evaluation": {}}
+
+        prompt = f"""
+    请根据以下医学知识库信息回答问题：
+    {facts}
+
+    问题：{query}
+    请明确、简洁回答，不需要问诊结构。
+    """
+
+        answer = model.chat(query=prompt)
+        return {"answer": answer, "evaluation": {}}
+    
+    
+    def handle_drug_query(self, query, session):
+        entities = self.entity_linking(query)
+        print("entities:", entities)
+
+        disease = None
+
+        for e in entities:
+            if e["type"] == "disease":
+                disease = e["name"]
+                break
+
+        print("最终识别疾病:", disease)
+        if not disease:
+            # 尝试使用上一轮疾病
+            disease = session.get("last_disease")
+
+        if not disease:
+            return {
+                "answer": "未识别到具体疾病，请补充说明。",
+                "evaluation": {}
+            }
+
+        sql = f"""
+            MATCH (d:Disease {{name:'{disease}'}})-[:common_drug]->(n)
+            RETURN n.name AS drug
+        """
+
+        res = kg.g.run(sql).data()
+        drugs = [r["drug"] for r in res]
+
+        if not drugs:
+            return {
+                "answer": f"知识库中暂无 {disease} 的推荐药物信息。",
+                "evaluation": {}
+            }
+
+        prompt = f"""
+    疾病：{disease}
+    推荐药物：{drugs}
+
+    请简洁说明这些药物的作用，并提醒用户遵医嘱。
+    """
+
+        answer = model.chat(query=prompt)
+
+        return {"answer": answer, "evaluation": {}}
 
     def retrieve_disease_by_symptom(self, symptom_name):
         sql = f"""
@@ -259,6 +454,25 @@ class KGRAG():
                 disease_score[d] = disease_score.get(d, 0) + 1  # 命中一个症状 +1
 
         return disease_score
+    
+    def compress_history(self, history):
+        """
+        将历史对话压缩为简要摘要
+        """
+        if not history:
+            return ""
+
+        prompt = f"""
+    请将以下对话压缩为不超过100字的医学问诊摘要，
+    保留：疾病、症状、用药信息。
+
+    对话：
+    {history}
+
+    仅返回摘要。
+    """
+        summary = model.chat(query=prompt)
+        return summary
 
 
 
